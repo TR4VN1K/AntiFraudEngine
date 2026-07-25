@@ -1,15 +1,22 @@
-# Anti-Fraud Engine
+# 🛡️ High-Performance Anti-Fraud Engine
 
-A small, self-contained **C++17/20** engine for real-time transaction fraud
-scoring, exposed to **Python** through [pybind11](https://github.com/pybind/pybind11).
+[ Читать на русском ](README.md) | [ Read in English ](README_EN.md)
 
-Built as a portfolio project to demonstrate: modern C++ design (RAII, smart
-pointers, templates), a hand-rolled concurrent data structure (striped
-locking), a pluggable rule-engine architecture, and clean Python
-interoperability — with correctness backed by ThreadSanitizer/ASan/UBSan runs
-rather than just "it compiles."
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.8%2B-green.svg)
+![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
+![License](https://img.shields.io/badge/license-MIT-orange.svg)
 
-```
+Высокопроизводительный C++20 движок первичной проверки транзакций на фрод с
+привязками к Python через [pybind11](https://github.com/pybind/pybind11).
+
+Проект разработан как портфолио для демонстрации навыков проектирования на
+C++ (RAII, умные указатели, шаблоны), написания потокобезопасных структур
+данных (Striped Locking) и оптимизации систем под задачи с высокой нагрузкой
+(Low-Latency). Корректность подтверждена прогонами под ThreadSanitizer /
+AddressSanitizer / UBSan, а не только фактом компиляции.
+
+```bash
 $ python3 scripts/demo_benchmark.py 200000
 ...
 [PASS] High amount              expected=HIGH_AMOUNT          got=HIGH_AMOUNT
@@ -21,25 +28,34 @@ Effective throughput:                         ~700,000 tx/s
 Cards currently tracked in cache:             5,000
 ```
 
-## Table of contents
+## 🚀 Архитектура и инженерные решения
 
-- [Architecture](#architecture)
-- [Repository layout](#repository-layout)
-- [Building](#building)
-- [Python usage](#python-usage)
-- [Rules](#rules)
-- [Design notes](#design-notes)
-- [Testing](#testing)
-- [Roadmap / non-goals](#roadmap--non-goals)
+Архитектура системы делится на 4 чётких слоя:
 
-## Architecture
+- **`AntiFraudEngine` (Pipeline Runner)** — управляет последовательностью
+  выполнения правил и содержит единый кэш `CardCache`. Метод `check()`
+  замеряет время обработки, запускает правила в порядке их регистрации и
+  мгновенно завершает проверку (*short-circuit*) при первом обнаружении
+  фрода.
+- **`IFraudRule` (Stateless Rules)** — иерархия правил (Open-Closed
+  Principle). Объекты правил хранят только конфигурационные пороги. Всё
+  изменяемое состояние карт вынесено в общий кэш, что позволяет параллельно
+  выполнять одно и то же правило из разных потоков.
+- **`ConcurrentMap` (Striped Locking Cache)** — потокобезопасная
+  хэш-таблица. Разбивает пространство ключей на `N` сегментов (шардов),
+  каждый из которых защищён отдельным `std::shared_mutex`. Это сводит
+  блокировки (*lock contention*) к минимуму при обработке множества
+  независимых карт.
+- **`SlidingWindow<T>` (In-Memory State)** — временнóе скользящее окно на
+  базе `std::deque` с амортизированной сложностью O(1) для очистки
+  устаревших записей при добавлении новых транзакций.
 
 ```
                       ┌─────────────────────────┐
 Python ── pybind11 ──▶│      AntiFraudEngine     │
                       │  (rule pipeline runner)  │
                       └───────────┬──────────────┘
-                                  │ evaluate() for each rule, in order
+                                  │ evaluate() для каждого правила по порядку
                     ┌─────────────┼──────────────┬───────────────┐
                     ▼             ▼              ▼               ▼
             HighAmountRule  VelocityRule   VolumeRule      GeoSpeedRule
@@ -54,52 +70,61 @@ Python ── pybind11 ──▶│      AntiFraudEngine     │
                                        last_country, last_timestamp }
 ```
 
-- **`AntiFraudEngine`** owns an ordered list of `IFraudRule`s and a single
-  `CardCache`. `check()` runs each rule in registration order and
-  short-circuits on the first rule that flags the transaction.
-- **Rules** are stateless configuration objects (thresholds only); all
-  *mutable* per-card state lives in the shared `CardCache`, so a single rule
-  instance can be safely invoked concurrently for different cards.
-- **`ConcurrentMap`** partitions the key space into `N` shards, each guarded
-  by its own `std::shared_mutex` (striped locking), so unrelated cards never
-  contend on the same lock.
-- **`SlidingWindow<T>`** is a `std::deque`-backed time window with amortized
-  O(1) eviction of stale entries per push.
+**Почему striped locking, а не один общий мьютекс или мьютекс на карту?**
+Один общий мьютекс сериализовал бы весь трафик независимо от того, какие
+карты участвуют. Мьютекс на каждую карту снижает конкуренцию, но приводит к
+неограниченному выделению блокировок и плохо амортизируется на кэше с
+длинным хвостом редко встречающихся карт. Striped locking (фиксированный
+массив из `N` мьютексов, шард выбирается как `hash(card_id) % N`) —
+стандартный компромисс: память растёт O(1), а карты равномерно
+распределяются по шардам, так что несвязанный трафик хорошо
+параллелится на практике.
 
-## Repository layout
+**Почему `check()` завершается по first-match?** После срабатывания правила
+побочные эффекты последующих правил на `CardState` для этой транзакции не
+выполняются. Это осознанный компромисс простота/производительность для
+портфолио-проекта; в продакшене логичнее было бы прогонять все правила ради
+наблюдаемости и использовать только первое/самое серьёзное совпадение для
+итогового решения.
+
+**Без сети и внешних сервисов.** Всё работает in-process: ни сокетов, ни
+портов, ни базы данных. Состояние живёт в памяти на протяжении жизни объекта
+`AntiFraudEngine`; для очистки используется `reset_state()`.
+
+## 📁 Структура репозитория
 
 ```
 .
-├── CMakeLists.txt              # pybind11_add_module + static core library
+├── CMakeLists.txt              # pybind11_add_module + статическая библиотека ядра
 ├── include/
-│   ├── AntiFraudEngine.h       # Engine facade: rule pipeline + cache
-│   ├── SlidingWindow.h         # Template: time-based sliding window
-│   ├── ConcurrentMap.h         # Template: striped-lock thread-safe map
-│   └── Rules.h                 # IFraudRule + 4 concrete rules
+│   ├── AntiFraudEngine.h       # Фасад движка: пайплайн правил + кэш
+│   ├── SlidingWindow.h         # Шаблон: скользящее окно по времени
+│   ├── ConcurrentMap.h         # Шаблон: потокобезопасная карта с Striped Lock
+│   └── Rules.h                 # Интерфейс IFraudRule и 4 реализации правил
 ├── src/
 │   ├── AntiFraudEngine.cpp
 │   ├── Rules.cpp
-│   └── bindings.cpp            # pybind11 module definition
+│   └── bindings.cpp            # Определение модуля pybind11
 ├── scripts/
-│   └── demo_benchmark.py       # Throughput benchmark + rule scenarios
+│   └── demo_benchmark.py       # Бенчмарк производительности и сценарии
 ├── tests/
-│   └── tsan_stress.cpp         # Pure-C++ concurrency stress test
+│   └── tsan_stress.cpp         # Стресс-тест многопоточности на чистом C++
 └── README.md
 ```
 
-## Building
+## 🛠️ Сборка и запуск
 
-### Requirements
+### Требования
 
-- A C++20 compiler (GCC ≥ 10, Clang ≥ 12, MSVC ≥ 19.29)
+- Компилятор C++20 (GCC ≥ 10, Clang ≥ 12, MSVC ≥ 19.29)
 - CMake ≥ 3.15
-- Python ≥ 3.8 with development headers
-- [pybind11](https://pypi.org/project/pybind11/) (`pip install pybind11`)
+- Python ≥ 3.8 с dev-заголовками
+- Пакет [pybind11](https://pypi.org/project/pybind11/) (`pip install pybind11`)
 
-### Build steps
+### Инструкция по сборке
 
 ```bash
-git clone https://github.com/<you>/antifraud-engine.git
+git clone https://github.com/<your-username>/antifraud-engine.git
 cd antifraud-engine
 
 pip install pybind11
@@ -111,29 +136,30 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 cmake --build . -j
 ```
 
-This produces `antifraud_core*.so` (Linux/macOS) or `antifraud_core*.pyd`
-(Windows) inside `build/`.
+В результате в `build/` появится `antifraud_core*.so` (Linux/macOS) или
+`antifraud_core*.pyd` (Windows).
 
-### Running the demo
+### Запуск демо и бенчмарка
 
 ```bash
-# from build/, so Python can find the freshly built extension
+# Из папки build/, чтобы Python видел скомпилированный бинарник (.so / .pyd)
 PYTHONPATH=. python3 ../scripts/demo_benchmark.py 200000
 ```
 
-The argument (default `200000`) controls how many synthetic transactions the
-throughput benchmark generates.
+Аргумент (по умолчанию `200000`) задаёт число синтетических транзакций,
+которые генерирует бенчмарк пропускной способности.
 
-Alternatively, install the module onto your `PYTHONPATH` (e.g. copy the
-`.so`/`.pyd` file into your project, or `cmake --install .` into a directory
-already on `PYTHONPATH`).
+Альтернативно модуль можно установить в свой `PYTHONPATH` (скопировать
+`.so`/`.pyd` в проект, либо выполнить `cmake --install .` в директорию, уже
+находящуюся в `PYTHONPATH`).
 
-## Python usage
+## 💻 Использование в Python
 
 ```python
 import antifraud_core as af
 
-engine = af.AntiFraudEngine()  # default thresholds, see below
+# Инициализация движка с дефолтными лимитами
+engine = af.AntiFraudEngine()
 
 tx = af.Transaction(
     id=1,
@@ -145,10 +171,10 @@ tx = af.Transaction(
 
 result = engine.check(tx)
 print(result.is_fraud, result.reason_code, result.processing_time_ns)
-# True 1 187   -> ReasonCode.HIGH_AMOUNT
+# True 1 187  -> ReasonCode.HIGH_AMOUNT
 ```
 
-### Custom thresholds
+### Настройка порогов срабатывания
 
 ```python
 engine = af.AntiFraudEngine(
@@ -161,7 +187,7 @@ engine = af.AntiFraudEngine(
 )
 ```
 
-### Reason codes
+### Коды причин (`ReasonCode`)
 
 ```python
 af.ReasonCode.OK                     # 0
@@ -171,67 +197,48 @@ af.ReasonCode.VOLUME_EXCEEDED        # 3
 af.ReasonCode.IMPOSSIBLE_GEO_SPEED   # 4
 ```
 
-### Concurrency from Python
+### Многопоточность из Python
 
-`AntiFraudEngine.check()` releases the GIL for the duration of the C++ call
-(`py::call_guard<py::gil_scoped_release>()`), so it's safe — and useful — to
-call it from multiple Python threads (e.g. via `concurrent.futures.ThreadPoolExecutor`)
-to score independent cards in parallel.
+Метод `AntiFraudEngine.check()` автоматически освобождает GIL на время
+выполнения C++ вызова (`py::call_guard<py::gil_scoped_release>()`), поэтому
+его безопасно — и полезно — вызывать из нескольких Python-потоков (например,
+через `concurrent.futures.ThreadPoolExecutor`), чтобы параллельно
+обрабатывать независимые карты.
 
-## Rules
+## 🔍 Поддерживаемые правила
 
-| Rule              | Triggers when...                                                                 | Reason code            |
-|-------------------|-----------------------------------------------------------------------------------|-------------------------|
-| `HighAmountRule`   | a single transaction's amount exceeds a fixed threshold                          | `HIGH_AMOUNT`           |
-| `VelocityRule`     | a card makes more than `max_count` transactions within a rolling window          | `VELOCITY_EXCEEDED`     |
-| `VolumeRule`       | a card's cumulative spend within a rolling window exceeds a limit                | `VOLUME_EXCEEDED`       |
-| `GeoSpeedRule`     | the implied travel speed between two consecutive countries exceeds a threshold   | `IMPOSSIBLE_GEO_SPEED`  |
+| Правило            | Условие срабатывания                                                              | Код ошибки (`ReasonCode`) |
+|---------------------|-------------------------------------------------------------------------------------|-----------------------------|
+| `HighAmountRule`   | сумма одной транзакции превышает фиксированный лимит                              | `HIGH_AMOUNT`               |
+| `VelocityRule`     | количество транзакций по карте за короткий интервал больше `max_count`            | `VELOCITY_EXCEEDED`         |
+| `VolumeRule`       | суммарный оборот по карте за окно времени превышает лимит                         | `VOLUME_EXCEEDED`           |
+| `GeoSpeedRule`     | рассчитанная скорость перемещения между двумя странами физически невозможна       | `IMPOSSIBLE_GEO_SPEED`      |
 
-Rules run in registration order and the engine short-circuits on the first
-match, so `reason_code` always reflects the *first* rule that fired (default
-order: HighAmount → Velocity → Volume → GeoSpeed). `GeoSpeedRule` uses a
-small built-in table of approximate country centroids and a haversine
-distance calculation; unknown country codes are never flagged.
+Правила выполняются в порядке регистрации, и движок останавливается на первом
+совпадении, поэтому `reason_code` всегда отражает *первое* сработавшее
+правило (порядок по умолчанию: HighAmount → Velocity → Volume → GeoSpeed).
+`GeoSpeedRule` использует небольшую встроенную таблицу приблизительных
+координат центров стран и расчёт расстояния по формуле гаверсинуса;
+неизвестные коды стран никогда не флагуются.
 
-Custom rules can be added from C++ by subclassing `IFraudRule` and calling
-`engine.addRule(std::make_unique<MyRule>(...))` — this hook is not currently
-exposed to Python, since a Python-implemented rule would have to reacquire
-the GIL on every call, defeating the purpose of releasing it in `check()`.
+Свои правила можно добавлять со стороны C++, унаследовавшись от `IFraudRule`
+и вызвав `engine.addRule(std::make_unique<MyRule>(...))` — этот механизм пока
+не проброшен в Python, так как Python-реализация правила была бы вынуждена
+захватывать GIL на каждый вызов, что сводило бы на нет смысл его освобождения
+в `check()`.
 
-## Design notes
+## 🧪 Тестирование и валидация
 
-- **Why striped locking instead of one global mutex or one mutex per card?**
-  A single global mutex would serialize all traffic regardless of which
-  cards are involved. A mutex per card would avoid contention but adds
-  unbounded lock allocation and doesn't amortize well for a cache with a
-  long tail of rarely-seen cards. Striped locking (a fixed array of `N`
-  shard mutexes, shard chosen by `hash(card_id) % N`) is the standard
-  middle ground: O(1) memory overhead, and cards hash-distribute across
-  shards so unrelated traffic parallelizes well in practice.
-- **Why separate sliding windows for `VelocityRule` and `VolumeRule`?**
-  Both track "amount over time" but are normally configured with different
-  window durations (e.g. 60s vs. 1h). Keeping their windows independent
-  means either rule can be added, removed, or reconfigured without
-  silently changing the other's behavior.
-- **Why does `check()` short-circuit?** Once a transaction is flagged, later
-  rules' side effects on `CardState` don't run for that transaction. This
-  is a deliberate simplicity/performance trade-off for a portfolio engine;
-  a production system might instead run every rule for observability and
-  only use the first/highest-severity match for the final decision.
-- **No networking, no external services.** Everything here is in-process:
-  no sockets, no ports, no database. State lives entirely in memory for the
-  lifetime of the `AntiFraudEngine` object; use `reset_state()` to clear it.
-
-## Testing
-
-- `scripts/demo_benchmark.py` doubles as a lightweight correctness check: it
-  asserts each of the four rules fires with its expected `reason_code` on a
-  crafted scenario, and exits with a non-zero status if any scenario fails.
-- `tests/tsan_stress.cpp` is a pure-C++ (no Python) stress test that hammers
-  `AntiFraudEngine::check()` from 16 threads against a small, deliberately
-  contended pool of `card_id`s. It's meant to be built with sanitizers to
-  validate the concurrency design directly, independent of the Python
-  binding layer:
+- **Демо и интеграционный тест:** `scripts/demo_benchmark.py` проверяет, что
+  каждое из четырёх правил срабатывает с ожидаемым `reason_code` на заранее
+  подготовленном сценарии, и завершает работу с ненулевым кодом возврата,
+  если хотя бы один сценарий не прошёл. Заодно измеряет пропускную
+  способность (>700 000 операций в секунду).
+- **Многопоточный тест под санитайзерами:** `tests/tsan_stress.cpp` — чистый
+  C++ (без Python) стресс-тест, который нагружает `AntiFraudEngine::check()`
+  из 16 потоков на небольшом, намеренно конкурентном пуле `card_id`.
+  Предназначен для сборки с санитайзерами, чтобы напрямую проверить
+  корректность конкурентного дизайна, независимо от слоя Python-биндингов:
 
   ```bash
   g++ -std=c++20 -fsanitize=thread -g -O1 -Iinclude \
@@ -245,19 +252,19 @@ the GIL on every call, defeating the purpose of releasing it in `check()`.
   ./asan_stress
   ```
 
-  Both configurations run clean (no reported races, no memory/UB errors)
-  against 320,000 concurrent `check()` calls across 64 shared cards.
+  Обе конфигурации проходят чисто (0 гонок, 0 ошибок памяти/UB) на 320 000
+  конкурентных вызовов `check()` для 64 общих карт.
 
-## Roadmap / non-goals
+## 🗺️ Roadmap / не входит в задачи проекта
 
-Deliberately out of scope for this project, to keep it a focused, readable
-portfolio piece rather than a production fraud platform:
+Осознанно вне рамок проекта — чтобы он оставался сфокусированным, читаемым
+портфолио-проектом, а не production fraud-платформой:
 
-- Persistence / durability of card state across process restarts
-- Distributed deployment, sharding across machines, or a network API
-- Machine-learning-based scoring (this is a rules engine by design)
-- A Python-side rule-authoring API
+- Персистентность/сохранение состояния карт между перезапусками процесса
+- Распределённое развёртывание, шардирование между машинами или сетевой API
+- Скоринг на основе машинного обучения (это rule-based движок по замыслу)
+- Python-API для написания собственных правил
 
-## License
+## 📜 Лицензия
 
-MIT — see [LICENSE](LICENSE).
+Проект распространяется под лицензией MIT. Подробнее см. файл [LICENSE](LICENSE).
