@@ -58,9 +58,9 @@ def reason_name(code: int) -> str:
     return REASON_NAMES.get(code, f"UNKNOWN({code})")
 
 
-# ---------------------------------------------------------------------------
+
 # 1. Throughput benchmark
-# ---------------------------------------------------------------------------
+
 
 def generate_normal_transactions(n: int, base_timestamp: int, num_cards: int = 5000):
     """Generates n synthetic, mostly-benign transactions spread across
@@ -150,9 +150,9 @@ def run_throughput_benchmark(engine: "af.AntiFraudEngine", n: int = 200_000) -> 
     print()
 
 
-# ---------------------------------------------------------------------------
+
 # 2. Rule-triggering scenarios
-# ---------------------------------------------------------------------------
+
 
 @dataclass
 class Scenario:
@@ -243,9 +243,9 @@ def run_scenarios() -> bool:
     return all_ok
 
 
-# ---------------------------------------------------------------------------
+
 # Entry point
-# ---------------------------------------------------------------------------
+
 
 def main() -> int:
     random.seed(42)
