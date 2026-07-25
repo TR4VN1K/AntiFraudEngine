@@ -1,0 +1,17 @@
+build/
+build-*/
+*.so
+*.dylib
+*.dll
+*.pyd
+__pycache__/
+*.pyc
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+Makefile
+*.egg-info/
+dist/
+.vscode/
+.idea/
